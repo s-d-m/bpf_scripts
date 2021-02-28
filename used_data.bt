@@ -1,0 +1,90 @@
+#!/usr/bin/bpftrace
+
+/*
+ This bpfscript prints the amount of data transfered by a program.
+ To use it, replace YourProcNameHere in this file by the name of the
+ program of interest. Note: this script needs to be started before
+ the program to supervise.
+*/
+
+#include <linux/socket.h>
+#include <linux/signal.h>
+
+BEGIN
+{
+  printf("Start your process from another shell\n");
+  printf("Ctrl+C to quit\n");
+  @sent = 0;
+  @received = 0;
+  @proc_pid = -1;
+}
+
+tracepoint:syscalls:sys_exit_exec*
+/strncmp(comm, "YourProcNameHere", 15) == 0/
+{
+  @to_trace[pid] = 1;
+  @proc_pid = pid;
+  @pidname[pid] = comm;
+  printf("Process started. Counting data tranfer\n");
+}
+
+tracepoint:syscalls:sys_exit_fork,
+tracepoint:syscalls:sys_exit_vfork,
+tracepoint:syscalls:sys_exit_clone
+{
+  if ((@to_trace[pid]) && (args->ret != 0)) {
+    @to_trace[args->ret] = 1
+  }
+}
+
+tracepoint:syscalls:sys_enter_exit,
+tracepoint:syscalls:sys_enter_exit_group
+/@to_trace[pid]/
+{
+  delete(@to_trace[pid]);
+
+  if ((int64) pid == @proc_pid) {
+    exit();
+  }
+}
+
+kretprobe:sock_recvmsg,
+kretprobe:inet_recvmsg
+/@to_trace[pid]/
+{
+  if ((retval & 0x7FFFFFFF) == retval) {
+    @received += (int64)retval;
+  }
+}
+
+kretprobe:sock_sendmsg,
+kretprobe:inet_sendmsg
+/@to_trace[pid]/
+{
+  if ((retval & 0x7FFFFFFF) == retval) {
+    @sent += (int64)retval;
+  }
+}
+
+interval:s:1
+/@proc_pid != -1/
+{
+  time();
+  printf("received %d sent %d\n", @received, @sent);
+}
+
+tracepoint:signal:signal_generate
+/(@to_trace[args->pid]) && (args->sig != SIGWINCH) && (args->sig != SIGCHLD) && (args->sig != SIGURG)/
+{
+  delete(@to_trace[args->pid]);
+
+  if ((int64) pid == @proc_pid) {
+    exit();
+  }  
+}
+
+END {
+  clear(@pidname);
+  clear(@to_trace);
+  clear(@proc_pid);
+}
